@@ -7,7 +7,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 import cv2
 from flask import Flask, Response, request
@@ -33,15 +33,36 @@ class MotionState:
     changed_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class PullPointSubscription:
+    token: str
+    expires_at: float
+
+
+def format_utc_xml(ts: Optional[float] = None) -> str:
+    base = dt.datetime.utcfromtimestamp(ts if ts is not None else time.time())
+    return base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 class MotionDetector(threading.Thread):
-    def __init__(self, rtsp_url: str):
+    def __init__(self, rtsp_url: str, debug_window: bool = False):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
+        self.debug_window = debug_window
         self.state = MotionState()
+        self.state_lock = threading.Lock()
         self._stop_event = threading.Event()
 
     def stop(self):
         self._stop_event.set()
+
+    def get_state(self) -> MotionState:
+        with self.state_lock:
+            return MotionState(
+                detected=self.state.detected,
+                confidence=self.state.confidence,
+                changed_at=self.state.changed_at,
+            )
 
     def run(self):
         logging.info("Starting motion detector from RTSP: %s", self.rtsp_url)
@@ -51,6 +72,10 @@ class MotionDetector(threading.Thread):
         if not cap.isOpened():
             logging.error("Unable to open RTSP stream for motion detection.")
             return
+
+        if self.debug_window:
+            cv2.namedWindow("motion-debug", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("motion-mask", cv2.WINDOW_NORMAL)
 
         while not self._stop_event.is_set():
             ok, frame = cap.read()
@@ -71,12 +96,28 @@ class MotionDetector(threading.Thread):
             detected = motion_score > 1500
             confidence = min(1.0, motion_score / 15000)
 
-            if detected != self.state.detected:
-                self.state.changed_at = time.time()
-            self.state.detected = detected
-            self.state.confidence = confidence
+            with self.state_lock:
+                if detected != self.state.detected:
+                    self.state.changed_at = time.time()
+                self.state.detected = detected
+                self.state.confidence = confidence
+
+            if self.debug_window:
+                debug_frame = frame.copy()
+                text = f"motion={detected} conf={confidence:.2f} score={motion_score:.1f}"
+                cv2.putText(debug_frame, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.imshow("motion-debug", debug_frame)
+                cv2.imshow("motion-mask", th)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    logging.info("Debug window requested stop (q key).")
+                    self._stop_event.set()
+
             time.sleep(0.05)
 
+        if self.debug_window:
+            cv2.destroyWindow("motion-debug")
+            cv2.destroyWindow("motion-mask")
         cap.release()
 
 
@@ -175,16 +216,18 @@ def wsse_auth_ok(xml_text: str, username: str, password: str) -> bool:
     return bool(un is not None and pw is not None and un.text == username and pw.text == password)
 
 
-def create_app(bind_host: str, service_host: str, port: int, rtsp_url: str, username: str, password: str):
+def create_app(bind_host: str, service_host: str, port: int, rtsp_url: str, username: str, password: str, debug_window: bool):
     app = Flask(__name__)
     endpoint_uuid = str(uuid.uuid4())
     endpoint = f"http://{service_host}:{port}"
 
-    motion = MotionDetector(rtsp_url)
+    motion = MotionDetector(rtsp_url, debug_window=debug_window)
     motion.start()
 
     discovery = WSDiscoveryResponder(endpoint_uuid=endpoint_uuid, xaddr=f"{endpoint}/onvif/device_service")
     discovery.start()
+
+    subscriptions: Dict[str, PullPointSubscription] = {}
 
     def check_auth(xml_text: str) -> Optional[Response]:
         auth = request.authorization
@@ -192,6 +235,64 @@ def create_app(bind_host: str, service_host: str, port: int, rtsp_url: str, user
         if basic_ok or wsse_auth_ok(xml_text, username, password):
             return None
         return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="ONVIF"'})
+
+    def build_pull_messages_response() -> str:
+        state = motion.get_state()
+        changed = format_utc_xml(state.changed_at)
+        value = "true" if state.detected else "false"
+        current_time = format_utc_xml()
+        termination_time = format_utc_xml(time.time() + 3600)
+        return f"""
+<s:Body><tev:PullMessagesResponse xmlns:tev="{TEV_NS}" xmlns:wsnt="{WSNT_NS}" xmlns:tt="{TT_NS}">
+<wsnt:CurrentTime>{current_time}</wsnt:CurrentTime>
+<wsnt:TerminationTime>{termination_time}</wsnt:TerminationTime>
+<wsnt:NotificationMessage>
+<wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic>
+<wsnt:Message><tt:Message UtcTime="{changed}" PropertyOperation="Changed">
+<tt:Source><tt:SimpleItem Name="VideoSourceConfigurationToken" Value="vsc1"/></tt:Source>
+<tt:Data><tt:SimpleItem Name="IsMotion" Value="{value}"/><tt:SimpleItem Name="Confidence" Value="{state.confidence:.2f}"/></tt:Data>
+</tt:Message></wsnt:Message>
+</wsnt:NotificationMessage>
+</tev:PullMessagesResponse></s:Body>"""
+
+    def handle_events_action(action: str) -> str:
+        if action == "GetEventProperties":
+            return f"""
+<s:Body><tev:GetEventPropertiesResponse xmlns:tev="{TEV_NS}" xmlns:wstop="{WSTOP_NS}" xmlns:wsnt="{WSNT_NS}">
+<tev:TopicNamespaceLocation>http://www.onvif.org/ver10/topics/topicns.xml</tev:TopicNamespaceLocation>
+<tev:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</tev:TopicExpressionDialect>
+<tev:TopicExpressionDialect>http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete</tev:TopicExpressionDialect>
+<tev:MessageContentFilterDialect>http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter</tev:MessageContentFilterDialect>
+<tev:MessageContentSchemaLocation>http://www.onvif.org/ver10/schema/onvif.xsd</tev:MessageContentSchemaLocation>
+<tev:ProducerPropertiesFilterDialect>http://www.onvif.org/ver10/tev/producerPropertiesFilter/ItemFilter</tev:ProducerPropertiesFilterDialect>
+<tev:FixedTopicSet>true</tev:FixedTopicSet>
+<wstop:TopicSet><tns1:RuleEngine xmlns:tns1="http://www.onvif.org/ver10/topics"><tns1:CellMotionDetector><tns1:Motion/></tns1:CellMotionDetector></tns1:RuleEngine></wstop:TopicSet>
+</tev:GetEventPropertiesResponse></s:Body>"""
+
+        if action == "CreatePullPointSubscription":
+            token = str(uuid.uuid4())
+            subscriptions[token] = PullPointSubscription(token=token, expires_at=time.time() + 3600)
+            return f"""
+<s:Body><tev:CreatePullPointSubscriptionResponse xmlns:tev="{TEV_NS}" xmlns:wsnt="{WSNT_NS}" xmlns:wsa="{WSA_NS}">
+<wsnt:SubscriptionReference><wsa:Address>{endpoint}/onvif/pullpoint/{token}</wsa:Address></wsnt:SubscriptionReference>
+<wsnt:CurrentTime>{format_utc_xml()}</wsnt:CurrentTime>
+<wsnt:TerminationTime>{format_utc_xml(time.time() + 3600)}</wsnt:TerminationTime>
+</tev:CreatePullPointSubscriptionResponse></s:Body>"""
+
+        if action == "PullMessages":
+            return build_pull_messages_response()
+
+        if action == "Renew":
+            return f"""
+<s:Body><wsnt:RenewResponse xmlns:wsnt="{WSNT_NS}">
+<wsnt:TerminationTime>{format_utc_xml(time.time() + 3600)}</wsnt:TerminationTime>
+</wsnt:RenewResponse></s:Body>"""
+
+        if action == "Unsubscribe":
+            return f"""
+<s:Body><wsnt:UnsubscribeResponse xmlns:wsnt="{WSNT_NS}"/></s:Body>"""
+
+        return "<s:Body/>"
 
     @app.get("/")
     def index():
@@ -216,7 +317,7 @@ def create_app(bind_host: str, service_host: str, port: int, rtsp_url: str, user
             body = f"""
 <s:Body><tds:GetDeviceInformationResponse xmlns:tds="{TDS_NS}">
 <tds:Manufacturer>OpenAI-Lab</tds:Manufacturer><tds:Model>PyVirtualCam-ONVIF</tds:Model>
-<tds:FirmwareVersion>1.1.0</tds:FirmwareVersion><tds:SerialNumber>PY-ONVIF-0001</tds:SerialNumber>
+<tds:FirmwareVersion>1.2.0</tds:FirmwareVersion><tds:SerialNumber>PY-ONVIF-0001</tds:SerialNumber>
 <tds:HardwareId>Windows-Python312</tds:HardwareId></tds:GetDeviceInformationResponse></s:Body>"""
         elif action == "GetCapabilities":
             body = f"""
@@ -290,37 +391,30 @@ def create_app(bind_host: str, service_host: str, port: int, rtsp_url: str, user
             return auth_failed
 
         action = extract_action(xml_text)
-        if action == "GetEventProperties":
-            body = f"""
-<s:Body><tev:GetEventPropertiesResponse xmlns:tev="{TEV_NS}" xmlns:wstop="{WSTOP_NS}">
-<tev:TopicNamespaceLocation>http://www.onvif.org/ver10/topics/topicns.xml</tev:TopicNamespaceLocation>
-<wstop:TopicSet><tns1:RuleEngine xmlns:tns1="http://www.onvif.org/ver10/topics"><tns1:CellMotionDetector/></tns1:RuleEngine></wstop:TopicSet>
-</tev:GetEventPropertiesResponse></s:Body>"""
-        elif action == "CreatePullPointSubscription":
-            token = str(uuid.uuid4())
-            body = f"""
-<s:Body><tev:CreatePullPointSubscriptionResponse xmlns:tev="{TEV_NS}" xmlns:wsnt="{WSNT_NS}" xmlns:wsa="{WSA_NS}">
-<wsnt:SubscriptionReference><wsa:Address>{endpoint}/onvif/events_service?token={token}</wsa:Address></wsnt:SubscriptionReference>
-<wsnt:CurrentTime>{dt.datetime.utcnow().isoformat()}Z</wsnt:CurrentTime>
-<wsnt:TerminationTime>{(dt.datetime.utcnow() + dt.timedelta(hours=1)).isoformat()}Z</wsnt:TerminationTime>
-</tev:CreatePullPointSubscriptionResponse></s:Body>"""
-        elif action == "PullMessages":
-            state = motion.state
-            changed = dt.datetime.utcfromtimestamp(state.changed_at).isoformat() + "Z"
-            value = "true" if state.detected else "false"
-            body = f"""
-<s:Body><tev:PullMessagesResponse xmlns:tev="{TEV_NS}" xmlns:wsnt="{WSNT_NS}" xmlns:tt="{TT_NS}">
-<wsnt:NotificationMessage>
-<wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic>
-<wsnt:Message><tt:Message UtcTime="{changed}" PropertyOperation="Changed">
-<tt:Source><tt:SimpleItem Name="VideoSourceConfigurationToken" Value="vsc1"/></tt:Source>
-<tt:Data><tt:SimpleItem Name="IsMotion" Value="{value}"/><tt:SimpleItem Name="Confidence" Value="{state.confidence:.2f}"/></tt:Data>
-</tt:Message></wsnt:Message>
-</wsnt:NotificationMessage></tev:PullMessagesResponse></s:Body>"""
-        elif action in {"Renew", "Unsubscribe"}:
-            body = f"<s:Body><wsnt:{action}Response xmlns:wsnt=\"{WSNT_NS}\"/></s:Body>"
-        else:
-            body = "<s:Body/>"
+        body = handle_events_action(action)
+        return Response(soap_envelope(body), content_type="application/soap+xml; charset=utf-8")
+
+    @app.post("/onvif/pullpoint/<token>")
+    def pullpoint_service(token: str):
+        xml_text = request.data.decode("utf-8", errors="ignore")
+        auth_failed = check_auth(xml_text)
+        if auth_failed:
+            return auth_failed
+
+        sub = subscriptions.get(token)
+        if not sub or sub.expires_at < time.time():
+            fault = f"""
+<s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>
+<s:Reason><s:Text xml:lang="en">Subscription not found or expired</s:Text></s:Reason></s:Fault></s:Body>"""
+            return Response(soap_envelope(fault), content_type="application/soap+xml; charset=utf-8", status=404)
+
+        action = extract_action(xml_text)
+        if action == "Renew":
+            sub.expires_at = time.time() + 3600
+        elif action == "Unsubscribe":
+            subscriptions.pop(token, None)
+
+        body = handle_events_action(action)
         return Response(soap_envelope(body), content_type="application/soap+xml; charset=utf-8")
 
     @app.post("/onvif/ptz_service")
@@ -376,6 +470,7 @@ def main():
     parser.add_argument("--rtsp", default="rtsp://admin:a1234567@10.0.0.45:554/stream1", help="RTSP stream URL")
     parser.add_argument("--username", default="admin", help="ONVIF username")
     parser.add_argument("--password", default="a1234567", help="ONVIF password")
+    parser.add_argument("--debug-window", action="store_true", help="Show OpenCV motion debug windows")
     parser.add_argument("--log-level", default="INFO", help="log level")
     args = parser.parse_args()
 
@@ -390,6 +485,7 @@ def main():
         rtsp_url=args.rtsp,
         username=args.username,
         password=args.password,
+        debug_window=args.debug_window,
     )
     app.run(host=args.host, port=args.port, threaded=True)
 
