@@ -2,6 +2,7 @@ import argparse
 import base64
 import datetime as dt
 import hashlib
+import http.client
 import logging
 import re
 import socket
@@ -219,7 +220,10 @@ class PushEventNotifier(threading.Thread):
                 for k in expired:
                     self.subscriptions.pop(k, None)
                 for sub in list(self.subscriptions.values()):
-                    self._notify(sub, state)
+                    try:
+                        self._notify(sub, state)
+                    except Exception as exc:  # 防御性兜底，避免线程因单次通知异常退出
+                        logging.warning("Push notify unexpected error to %s: %s", sub.consumer_url, exc)
             time.sleep(0.2)
 
     @staticmethod
@@ -252,7 +256,7 @@ class PushEventNotifier(threading.Thread):
         try:
             with urllib.request.urlopen(req, timeout=3) as resp:
                 logging.debug("Push notify sent to %s status=%s", sub.consumer_url, resp.status)
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError, OSError) as exc:
             logging.warning("Push notify failed to %s: %s", sub.consumer_url, exc)
 
 
