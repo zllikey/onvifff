@@ -1,13 +1,44 @@
-# Python ONVIF 虚拟摄像头
+# Python ONVIF 虚拟摄像头（增强标准兼容）
 
-这是一个基于 Python + Flask 的 ONVIF 虚拟摄像头服务，支持：
+这是一个基于 Python + Flask 的 ONVIF 虚拟摄像头服务，重点增强了 **标准 WSDL 服务命名空间与服务发现能力**，用于提升 NVR 接入兼容性。
 
-- ONVIF Device / Media / Events 基础 SOAP 接口
-- 主码流/子码流 URI 可配置（默认都为 `rtsp://10.0.0.20:8554/tpipc45`）
-- 移动侦测和人形侦测，使用 **GET** webhook 触发
-- ONVIF 订阅（Subscribe）并向订阅回调地址主动推送事件
-- 可选地向 NVR 事件回调地址主动推送事件
-- Web 页面查看运行状态与使用说明
+## 功能
+
+- ONVIF Device / Media / Events / Imaging / PTZ 服务地址
+- Device 服务补充常见标准动作：
+  - `GetDeviceInformation`
+  - `GetSystemDateAndTime`
+  - `GetHostname`
+  - `GetScopes`
+  - `GetServices`（返回标准 Namespace + XAddr + Version）
+  - `GetCapabilities`
+- Media 服务补充常见动作：
+  - `GetServiceCapabilities`
+  - `GetProfiles` / `GetProfile`
+  - `GetVideoSources`
+  - `GetStreamUri`
+  - `GetSnapshotUri`
+- Events 服务补充常见动作：
+  - `GetServiceCapabilities`
+  - `GetEventProperties`
+  - `Subscribe`
+  - `CreatePullPointSubscription`
+  - `PullMessages`
+- 移动侦测 / 人形侦测：**GET webhook 触发**
+- 事件主动推送至：
+  1. 订阅回调地址（`ConsumerReference/Address`）
+  2. `CONFIG["nvr_callback_url"]`（可选）
+- Web 状态页与使用说明
+
+## 默认参数
+
+在 `app.py` 顶部 `CONFIG` 中可改：
+
+- 监听：`0.0.0.0:80`
+- 主码流：`rtsp://10.0.0.20:8554/tpipc45`
+- 子码流：`rtsp://10.0.0.20:8554/tpipc45`
+- 快照地址：`snapshot_uri`
+- NVR 回调地址：`nvr_callback_url`
 
 ## 启动
 
@@ -18,45 +49,27 @@ pip install -r requirements.txt
 sudo python3 app.py
 ```
 
-> 默认监听 `0.0.0.0:80`，如需修改请直接编辑 `app.py` 中 `CONFIG`。
+## 服务地址
 
-## 关键地址
-
-- Web 状态页: `http://<ip>/`
+- Web: `http://<ip>/`
 - 状态 JSON: `http://<ip>/status`
-- Device Service: `http://<ip>/onvif/device_service`
-- Media Service: `http://<ip>/onvif/media_service`
-- Events Service: `http://<ip>/onvif/events_service`
+- Device: `http://<ip>/onvif/device_service`
+- Media: `http://<ip>/onvif/media_service`
+- Events: `http://<ip>/onvif/events_service`
+- Imaging: `http://<ip>/onvif/imaging_service`
+- PTZ: `http://<ip>/onvif/ptz_service`
 
-## 触发侦测（GET）
+## 触发检测（GET）
 
-- 移动侦测：
-  `GET /trigger/motion?msg=MotionDetected`
-- 人形侦测：
-  `GET /trigger/human?msg=HumanDetected`
+- 移动侦测：`GET /trigger/motion?msg=MotionDetected`
+- 人形侦测：`GET /trigger/human?msg=HumanDetected`
 
-触发后将主动推送 ONVIF 事件给：
+## Subscribe 头要求（必须）
 
-1. 已订阅的 `ConsumerReference/Address`
-2. `CONFIG["nvr_callback_url"]`（如已配置）
-
-## Subscribe 要求
-
-订阅接口要求 Header 含：
+订阅时必须携带：
 
 ```text
 SOAPAction: "http://docs.oasis-open.org/wsn/bw-2/NotificationProducer/SubscribeRequest"
 ```
 
-且 SOAP Body 中需要包含 `ConsumerReference/Address`。
-
-## 参数配置
-
-在 `app.py` 顶部 `CONFIG` 中可设置：
-
-- 监听地址与端口
-- 摄像头信息
-- 主/子码流地址
-- NVR 回调地址
-- ONVIF 各服务路径
-
+否则会返回 SOAP Fault。
