@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Deque, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -19,8 +19,12 @@ NS_TDS = "http://www.onvif.org/ver10/device/wsdl"
 NS_TRT = "http://www.onvif.org/ver10/media/wsdl"
 NS_TEV = "http://www.onvif.org/ver10/events/wsdl"
 NS_TT = "http://www.onvif.org/ver10/schema"
+NS_WSNT = "http://docs.oasis-open.org/wsn/b-2"
+NS_WSA_2005 = "http://www.w3.org/2005/08/addressing"
+NS_WSA_2004 = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 
 SOAP_HEADERS = {"Content-Type": "application/soap+xml; charset=utf-8"}
+SUBSCRIBE_ACTION = "http://docs.oasis-open.org/wsn/bw-2/NotificationProducer/SubscribeRequest"
 
 
 class StreamConfig(BaseModel):
@@ -38,7 +42,6 @@ class EventPushConfig(BaseModel):
     timeout_sec: int = Field(default=3, ge=1, le=30)
 
 
-# 按需求：参数在 py 文件内配置，不通过 web 页面配置。
 STREAM_CONFIG = StreamConfig()
 EVENT_PUSH_CONFIG = EventPushConfig()
 
@@ -77,10 +80,27 @@ class EventBus:
         return list(self.events)[-limit:]
 
 
-app = FastAPI(title="ONVIF Virtual Camera", version="0.3.0")
+class SubscriptionStore:
+    def __init__(self) -> None:
+        self._targets: Dict[str, str] = {}
+
+    def add(self, callback_url: str) -> str:
+        sub_id = str(uuid.uuid4())
+        self._targets[sub_id] = callback_url
+        return sub_id
+
+    def all_targets(self) -> List[str]:
+        return list(self._targets.values())
+
+    def count(self) -> int:
+        return len(self._targets)
+
+
+app = FastAPI(title="ONVIF Virtual Camera", version="0.4.0")
 motion_state = DetectionState()
 person_state = DetectionState()
 event_bus = EventBus()
+subscription_store = SubscriptionStore()
 
 
 def _now_utc() -> str:
@@ -107,7 +127,7 @@ def build_device_response(method: str, request: Request) -> str:
             <tds:GetDeviceInformationResponse xmlns:tds=\"{NS_TDS}\">
               <tds:Manufacturer>VirtualCam Inc.</tds:Manufacturer>
               <tds:Model>Python ONVIF Virtual Camera</tds:Model>
-              <tds:FirmwareVersion>0.3.0</tds:FirmwareVersion>
+              <tds:FirmwareVersion>0.4.0</tds:FirmwareVersion>
               <tds:SerialNumber>VIRTUAL-001</tds:SerialNumber>
               <tds:HardwareId>SIM-ONVIF</tds:HardwareId>
             </tds:GetDeviceInformationResponse>
@@ -146,7 +166,7 @@ def build_device_response(method: str, request: Request) -> str:
                 <tt:Media xmlns:tt=\"{NS_TT}\"><tt:XAddr>{_service_url(request, '/onvif/media_service')}</tt:XAddr></tt:Media>
                 <tt:Events xmlns:tt=\"{NS_TT}\">
                   <tt:XAddr>{_service_url(request, '/onvif/events_service')}</tt:XAddr>
-                  <tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>
+                  <tt:WSSubscriptionPolicySupport>true</tt:WSSubscriptionPolicySupport>
                   <tt:WSPullPointSupport>true</tt:WSPullPointSupport>
                 </tt:Events>
               </tds:Capabilities>
@@ -206,11 +226,35 @@ def build_media_response(method: str) -> str:
     raise HTTPException(status_code=400, detail=f"Unsupported ONVIF media operation: {method}")
 
 
-def build_event_response(method: str) -> str:
+def _extract_subscribe_callback(xml_body: str) -> Optional[str]:
+    root = ET.fromstring(xml_body)
+    for ns in (NS_WSA_2005, NS_WSA_2004):
+        node = root.find(f".//{{{ns}}}Address")
+        if node is not None and node.text and node.text.strip():
+            return node.text.strip()
+    return None
+
+
+def _build_subscribe_response(request: Request, callback_url: str) -> str:
+    subscription_id = subscription_store.add(callback_url)
+    return soap_envelope(
+        f"""
+        <wsnt:SubscribeResponse xmlns:wsnt=\"{NS_WSNT}\" xmlns:wsa=\"{NS_WSA_2005}\">
+          <wsnt:SubscriptionReference>
+            <wsa:Address>{_service_url(request, f'/onvif/events_service/subscriptions/{subscription_id}')}</wsa:Address>
+          </wsnt:SubscriptionReference>
+          <wsnt:CurrentTime>{_now_utc()}</wsnt:CurrentTime>
+          <wsnt:TerminationTime>{_now_utc()}</wsnt:TerminationTime>
+        </wsnt:SubscribeResponse>
+        """
+    )
+
+
+def build_event_response(method: str, request: Request, xml_body: str) -> str:
     if method.endswith("CreatePullPointSubscription"):
         return soap_envelope(
             f"""
-            <tev:CreatePullPointSubscriptionResponse xmlns:tev=\"{NS_TEV}\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\">
+            <tev:CreatePullPointSubscriptionResponse xmlns:tev=\"{NS_TEV}\" xmlns:wsnt=\"{NS_WSNT}\">
               <wsnt:CurrentTime>{_now_utc()}</wsnt:CurrentTime>
               <wsnt:TerminationTime>{_now_utc()}</wsnt:TerminationTime>
             </tev:CreatePullPointSubscriptionResponse>
@@ -222,7 +266,7 @@ def build_event_response(method: str) -> str:
         messages = ""
         for item in items:
             messages += f"""
-            <wsnt:NotificationMessage>
+            <wsnt:NotificationMessage xmlns:wsnt=\"{NS_WSNT}\">
               <wsnt:Topic>{item['topic']}</wsnt:Topic>
               <wsnt:Message>
                 <tt:Message UtcTime=\"{item['ts']}\" PropertyOperation=\"Changed\" xmlns:tt=\"{NS_TT}\">
@@ -234,7 +278,7 @@ def build_event_response(method: str) -> str:
 
         return soap_envelope(
             f"""
-            <tev:PullMessagesResponse xmlns:tev=\"{NS_TEV}\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\">
+            <tev:PullMessagesResponse xmlns:tev=\"{NS_TEV}\" xmlns:wsnt=\"{NS_WSNT}\">
               <wsnt:CurrentTime>{_now_utc()}</wsnt:CurrentTime>
               <wsnt:TerminationTime>{_now_utc()}</wsnt:TerminationTime>
               {messages}
@@ -242,12 +286,18 @@ def build_event_response(method: str) -> str:
             """
         )
 
+    if method.endswith("Subscribe"):
+        callback_url = _extract_subscribe_callback(xml_body)
+        if not callback_url:
+            raise HTTPException(status_code=400, detail="Subscribe request missing callback address")
+        return _build_subscribe_response(request, callback_url)
+
     raise HTTPException(status_code=400, detail=f"Unsupported ONVIF event operation: {method}")
 
 
 def build_notify_soap(event_item: dict) -> str:
     return f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<s:Envelope xmlns:s=\"{NS_SOAP}\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:tt=\"{NS_TT}\">
+<s:Envelope xmlns:s=\"{NS_SOAP}\" xmlns:wsnt=\"{NS_WSNT}\" xmlns:tt=\"{NS_TT}\">
   <s:Body>
     <wsnt:Notify>
       <wsnt:NotificationMessage>
@@ -267,30 +317,50 @@ def build_notify_soap(event_item: dict) -> str:
 """
 
 
-def push_event_to_callback(event_item: dict) -> Optional[str]:
-    if not EVENT_PUSH_CONFIG.enabled:
-        return "disabled"
-
-    data = build_notify_soap(event_item).encode("utf-8")
+def _post_soap(url: str, soap_xml: str) -> str:
     req = urllib.request.Request(
-        url=EVENT_PUSH_CONFIG.callback_url,
-        data=data,
+        url=url,
+        data=soap_xml.encode("utf-8"),
         method="POST",
         headers={"Content-Type": "application/soap+xml; charset=utf-8"},
     )
     try:
         with urllib.request.urlopen(req, timeout=EVENT_PUSH_CONFIG.timeout_sec) as resp:
-            return f"http_{resp.status}"
+            return f"{url}:http_{resp.status}"
     except urllib.error.URLError as exc:
-        return f"push_failed:{exc.reason}"
+        return f"{url}:push_failed:{exc.reason}"
 
 
-def extract_action(xml_body: str) -> str:
+def push_event_to_callbacks(event_item: dict) -> List[str]:
+    if not EVENT_PUSH_CONFIG.enabled:
+        return ["disabled"]
+
+    results: List[str] = []
+    default_url = EVENT_PUSH_CONFIG.callback_url.strip()
+    if default_url:
+        results.append(_post_soap(default_url, build_notify_soap(event_item)))
+
+    for callback in subscription_store.all_targets():
+        if callback and callback != default_url:
+            results.append(_post_soap(callback, build_notify_soap(event_item)))
+    return results
+
+
+def extract_action(xml_body: str, soap_action: Optional[str]) -> str:
+    if soap_action:
+        action = soap_action.strip().strip('"')
+        if action == SUBSCRIBE_ACTION:
+            return "Subscribe"
+
     root = ET.fromstring(xml_body)
     body = root.find(f"{{{NS_SOAP}}}Body")
     if body is None or not list(body):
         raise HTTPException(status_code=400, detail="Invalid SOAP body")
-    return list(body)[0].tag
+
+    tag = list(body)[0].tag
+    if tag.endswith("Subscribe"):
+        return "Subscribe"
+    return tag
 
 
 @app.get("/health")
@@ -300,6 +370,7 @@ def health() -> dict:
         "detections": {"motion": motion_state.active(), "person": person_state.active()},
         "stream": STREAM_CONFIG.model_dump(),
         "event_push": EVENT_PUSH_CONFIG.model_dump(),
+        "subscriptions": {"count": subscription_store.count()},
     }
 
 
@@ -313,7 +384,7 @@ def webhook_motion_get(
     motion_state.active_until = time.time() + payload.duration_sec
     motion_state.confidence = payload.confidence
     event_item = event_bus.publish("tns1:RuleEngine/Motion", payload.model_dump())
-    push_result = push_event_to_callback(event_item)
+    push_result = push_event_to_callbacks(event_item)
     return {
         "accepted": True,
         "trigger": "motion",
@@ -333,7 +404,7 @@ def webhook_person_get(
     person_state.active_until = time.time() + payload.duration_sec
     person_state.confidence = payload.confidence
     event_item = event_bus.publish("tns1:Analytics/HumanDetection", payload.model_dump())
-    push_result = push_event_to_callback(event_item)
+    push_result = push_event_to_callbacks(event_item)
     return {
         "accepted": True,
         "trigger": "person",
@@ -345,22 +416,25 @@ def webhook_person_get(
 
 @app.post("/onvif/device_service")
 async def onvif_device_service(request: Request) -> Response:
-    method = extract_action((await request.body()).decode("utf-8"))
+    body = (await request.body()).decode("utf-8")
+    method = extract_action(body, request.headers.get("SOAPAction"))
     xml = build_device_response(method, request)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
 
 
 @app.post("/onvif/media_service")
 async def onvif_media_service(request: Request) -> Response:
-    method = extract_action((await request.body()).decode("utf-8"))
+    body = (await request.body()).decode("utf-8")
+    method = extract_action(body, request.headers.get("SOAPAction"))
     xml = build_media_response(method)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
 
 
 @app.post("/onvif/events_service")
-async def onvif_events_service(request: Request) -> Response:
-    method = extract_action((await request.body()).decode("utf-8"))
-    xml = build_event_response(method)
+async def onvif_events_service(request: Request, soapaction: Optional[str] = Header(default=None)) -> Response:
+    body = (await request.body()).decode("utf-8")
+    method = extract_action(body, soapaction)
+    xml = build_event_response(method, request, body)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
 
 
