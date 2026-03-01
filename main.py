@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import asyncio
-import io
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Literal, Optional
-import xml.etree.ElementTree as ET
+from typing import Deque, Dict, List, Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from PIL import Image, ImageDraw
 
 NS_SOAP = "http://www.w3.org/2003/05/soap-envelope"
 NS_TDS = "http://www.onvif.org/ver10/device/wsdl"
@@ -25,12 +22,16 @@ SOAP_HEADERS = {"Content-Type": "application/soap+xml; charset=utf-8"}
 
 
 class StreamConfig(BaseModel):
-    width: int = Field(default=1280, ge=160, le=3840)
-    height: int = Field(default=720, ge=120, le=2160)
-    fps: int = Field(default=15, ge=1, le=60)
-    bitrate_kbps: int = Field(default=2048, ge=128, le=20000)
-    codec: Literal["H264", "MJPEG"] = "MJPEG"
-    stream_path: str = "/stream.mjpg"
+    width: int = Field(default=1920, ge=160, le=3840)
+    height: int = Field(default=1080, ge=120, le=2160)
+    fps: int = Field(default=25, ge=1, le=60)
+    bitrate_kbps: int = Field(default=4096, ge=128, le=20000)
+    codec: Literal["H264", "MJPEG"] = "H264"
+    stream_uri: str = "rtsp://10.0.0.20:8554/tpipc45"
+
+
+# 需求：流参数直接在 py 文件中设定，不通过 Web 页面/接口动态修改。
+STREAM_CONFIG = StreamConfig()
 
 
 class WebhookEvent(BaseModel):
@@ -64,12 +65,10 @@ class EventBus:
         )
 
     def pull(self, limit: int = 10) -> List[dict]:
-        items = list(self.events)[-limit:]
-        return items
+        return list(self.events)[-limit:]
 
 
-app = FastAPI(title="ONVIF Virtual Camera", version="0.1.0")
-stream_config = StreamConfig()
+app = FastAPI(title="ONVIF Virtual Camera", version="0.2.0")
 motion_state = DetectionState()
 person_state = DetectionState()
 event_bus = EventBus()
@@ -99,7 +98,7 @@ def build_device_response(method: str, request: Request) -> str:
             <tds:GetDeviceInformationResponse xmlns:tds=\"{NS_TDS}\">
               <tds:Manufacturer>VirtualCam Inc.</tds:Manufacturer>
               <tds:Model>Python ONVIF Virtual Camera</tds:Model>
-              <tds:FirmwareVersion>0.1.0</tds:FirmwareVersion>
+              <tds:FirmwareVersion>0.2.0</tds:FirmwareVersion>
               <tds:SerialNumber>VIRTUAL-001</tds:SerialNumber>
               <tds:HardwareId>SIM-ONVIF</tds:HardwareId>
             </tds:GetDeviceInformationResponse>
@@ -134,12 +133,8 @@ def build_device_response(method: str, request: Request) -> str:
             f"""
             <tds:GetCapabilitiesResponse xmlns:tds=\"{NS_TDS}\">
               <tds:Capabilities>
-                <tt:Device xmlns:tt=\"{NS_TT}\">
-                  <tt:XAddr>{_service_url(request, '/onvif/device_service')}</tt:XAddr>
-                </tt:Device>
-                <tt:Media xmlns:tt=\"{NS_TT}\">
-                  <tt:XAddr>{_service_url(request, '/onvif/media_service')}</tt:XAddr>
-                </tt:Media>
+                <tt:Device xmlns:tt=\"{NS_TT}\"><tt:XAddr>{_service_url(request, '/onvif/device_service')}</tt:XAddr></tt:Device>
+                <tt:Media xmlns:tt=\"{NS_TT}\"><tt:XAddr>{_service_url(request, '/onvif/media_service')}</tt:XAddr></tt:Media>
                 <tt:Events xmlns:tt=\"{NS_TT}\">
                   <tt:XAddr>{_service_url(request, '/onvif/events_service')}</tt:XAddr>
                   <tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>
@@ -153,7 +148,7 @@ def build_device_response(method: str, request: Request) -> str:
     raise HTTPException(status_code=400, detail=f"Unsupported ONVIF device operation: {method}")
 
 
-def build_media_response(method: str, request: Request) -> str:
+def build_media_response(method: str) -> str:
     if method.endswith("GetProfiles"):
         return soap_envelope(
             f"""
@@ -162,15 +157,9 @@ def build_media_response(method: str, request: Request) -> str:
                 <tt:Name>MainStream</tt:Name>
                 <tt:VideoEncoderConfiguration token=\"encoder_main\">
                   <tt:Name>DefaultEncoder</tt:Name>
-                  <tt:Encoding>{stream_config.codec}</tt:Encoding>
-                  <tt:Resolution>
-                    <tt:Width>{stream_config.width}</tt:Width>
-                    <tt:Height>{stream_config.height}</tt:Height>
-                  </tt:Resolution>
-                  <tt:RateControl>
-                    <tt:FrameRateLimit>{stream_config.fps}</tt:FrameRateLimit>
-                    <tt:BitrateLimit>{stream_config.bitrate_kbps}</tt:BitrateLimit>
-                  </tt:RateControl>
+                  <tt:Encoding>{STREAM_CONFIG.codec}</tt:Encoding>
+                  <tt:Resolution><tt:Width>{STREAM_CONFIG.width}</tt:Width><tt:Height>{STREAM_CONFIG.height}</tt:Height></tt:Resolution>
+                  <tt:RateControl><tt:FrameRateLimit>{STREAM_CONFIG.fps}</tt:FrameRateLimit><tt:BitrateLimit>{STREAM_CONFIG.bitrate_kbps}</tt:BitrateLimit></tt:RateControl>
                 </tt:VideoEncoderConfiguration>
               </trt:Profiles>
             </trt:GetProfilesResponse>
@@ -183,15 +172,9 @@ def build_media_response(method: str, request: Request) -> str:
             <trt:GetVideoEncoderConfigurationsResponse xmlns:trt=\"{NS_TRT}\" xmlns:tt=\"{NS_TT}\">
               <trt:Configurations token=\"encoder_main\">
                 <tt:Name>DefaultEncoder</tt:Name>
-                <tt:Encoding>{stream_config.codec}</tt:Encoding>
-                <tt:Resolution>
-                  <tt:Width>{stream_config.width}</tt:Width>
-                  <tt:Height>{stream_config.height}</tt:Height>
-                </tt:Resolution>
-                <tt:RateControl>
-                  <tt:FrameRateLimit>{stream_config.fps}</tt:FrameRateLimit>
-                  <tt:BitrateLimit>{stream_config.bitrate_kbps}</tt:BitrateLimit>
-                </tt:RateControl>
+                <tt:Encoding>{STREAM_CONFIG.codec}</tt:Encoding>
+                <tt:Resolution><tt:Width>{STREAM_CONFIG.width}</tt:Width><tt:Height>{STREAM_CONFIG.height}</tt:Height></tt:Resolution>
+                <tt:RateControl><tt:FrameRateLimit>{STREAM_CONFIG.fps}</tt:FrameRateLimit><tt:BitrateLimit>{STREAM_CONFIG.bitrate_kbps}</tt:BitrateLimit></tt:RateControl>
               </trt:Configurations>
             </trt:GetVideoEncoderConfigurationsResponse>
             """
@@ -202,7 +185,7 @@ def build_media_response(method: str, request: Request) -> str:
             f"""
             <trt:GetStreamUriResponse xmlns:trt=\"{NS_TRT}\" xmlns:tt=\"{NS_TT}\">
               <trt:MediaUri>
-                <tt:Uri>{_service_url(request, stream_config.stream_path)}</tt:Uri>
+                <tt:Uri>{STREAM_CONFIG.stream_uri}</tt:Uri>
                 <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
                 <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
                 <tt:Timeout>PT60S</tt:Timeout>
@@ -234,14 +217,12 @@ def build_event_response(method: str) -> str:
               <wsnt:Topic>{item['topic']}</wsnt:Topic>
               <wsnt:Message>
                 <tt:Message UtcTime=\"{item['ts']}\" PropertyOperation=\"Changed\" xmlns:tt=\"{NS_TT}\">
-                  <tt:Data>
-                    <tt:SimpleItem Name=\"topic\" Value=\"{item['topic']}\"/>
-                    <tt:SimpleItem Name=\"id\" Value=\"{item['id']}\"/>
-                  </tt:Data>
+                  <tt:Data><tt:SimpleItem Name=\"topic\" Value=\"{item['topic']}\"/><tt:SimpleItem Name=\"id\" Value=\"{item['id']}\"/></tt:Data>
                 </tt:Message>
               </wsnt:Message>
             </wsnt:NotificationMessage>
             """
+
         return soap_envelope(
             f"""
             <tev:PullMessagesResponse xmlns:tev=\"{NS_TEV}\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\">
@@ -260,32 +241,16 @@ def extract_action(xml_body: str) -> str:
     body = root.find(f"{{{NS_SOAP}}}Body")
     if body is None or not list(body):
         raise HTTPException(status_code=400, detail="Invalid SOAP body")
-    method = list(body)[0].tag
-    return method
-
-
-def _current_status() -> Dict[str, bool]:
-    return {
-        "motion": motion_state.active(),
-        "person": person_state.active(),
-    }
+    return list(body)[0].tag
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "detections": _current_status(), "stream": stream_config.model_dump()}
-
-
-@app.get("/config/stream")
-def get_stream_config() -> dict:
-    return stream_config.model_dump()
-
-
-@app.put("/config/stream")
-def update_stream_config(payload: StreamConfig) -> dict:
-    global stream_config
-    stream_config = payload
-    return {"updated": True, "stream": stream_config.model_dump()}
+    return {
+        "status": "ok",
+        "detections": {"motion": motion_state.active(), "person": person_state.active()},
+        "stream": STREAM_CONFIG.model_dump(),
+    }
 
 
 @app.post("/webhook/motion")
@@ -306,54 +271,23 @@ def webhook_person(payload: WebhookEvent) -> dict:
 
 @app.post("/onvif/device_service")
 async def onvif_device_service(request: Request) -> Response:
-    body = (await request.body()).decode("utf-8")
-    method = extract_action(body)
+    method = extract_action((await request.body()).decode("utf-8"))
     xml = build_device_response(method, request)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
 
 
 @app.post("/onvif/media_service")
 async def onvif_media_service(request: Request) -> Response:
-    body = (await request.body()).decode("utf-8")
-    method = extract_action(body)
-    xml = build_media_response(method, request)
+    method = extract_action((await request.body()).decode("utf-8"))
+    xml = build_media_response(method)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
 
 
 @app.post("/onvif/events_service")
 async def onvif_events_service(request: Request) -> Response:
-    body = (await request.body()).decode("utf-8")
-    method = extract_action(body)
+    method = extract_action((await request.body()).decode("utf-8"))
     xml = build_event_response(method)
     return Response(content=xml, media_type="application/soap+xml", headers=SOAP_HEADERS)
-
-
-async def stream_generator():
-    while True:
-        image = Image.new("RGB", (stream_config.width, stream_config.height), color=(20, 20, 20))
-        draw = ImageDraw.Draw(image)
-        draw.text((16, 16), f"ONVIF Virtual Camera {datetime.now().strftime('%H:%M:%S')}", fill=(255, 255, 255))
-        draw.text((16, 44), f"Resolution: {stream_config.width}x{stream_config.height} FPS:{stream_config.fps}", fill=(120, 220, 255))
-
-        if motion_state.active():
-            draw.rectangle((10, stream_config.height - 90, 360, stream_config.height - 50), fill=(255, 165, 0))
-            draw.text((20, stream_config.height - 82), f"MOTION DETECTED ({motion_state.confidence:.2f})", fill=(0, 0, 0))
-
-        if person_state.active():
-            draw.rectangle((10, stream_config.height - 48, 360, stream_config.height - 8), fill=(255, 64, 64))
-            draw.text((20, stream_config.height - 40), f"PERSON DETECTED ({person_state.confidence:.2f})", fill=(255, 255, 255))
-
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=80)
-        frame = buf.getvalue()
-
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        await asyncio.sleep(1.0 / max(stream_config.fps, 1))
-
-
-@app.get("/stream.mjpg")
-async def mjpeg_stream() -> StreamingResponse:
-    return StreamingResponse(stream_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 if __name__ == "__main__":

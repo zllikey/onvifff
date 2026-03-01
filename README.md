@@ -3,11 +3,25 @@
 这是一个基于 FastAPI 的 ONVIF 虚拟摄像头示例服务，监听端口 **8000**，提供：
 
 - ONVIF Device / Media / Events 基础 SOAP 接口
-- 可配置流参数（分辨率、帧率、码率、编码类型、流路径）
 - Webhook 触发的移动侦测与人形侦测事件
-- MJPEG 虚拟视频流输出（用于调试和联调）
+- `GetStreamUri` 默认返回 RTSP 流：`rtsp://10.0.0.20:8554/tpipc45`
 
 > 说明：该实现覆盖常见联调所需的标准接口子集（GetCapabilities / GetServices / GetProfiles / GetStreamUri / PullMessages 等），可用于平台接入验证和流程联调。
+
+## 参数配置（仅 Python 文件内）
+
+按需求，流参数不再提供 Web 配置接口。请直接在 `main.py` 中修改 `STREAM_CONFIG`：
+
+- `width`
+- `height`
+- `fps`
+- `bitrate_kbps`
+- `codec`
+- `stream_uri`
+
+默认：
+
+- `stream_uri = rtsp://10.0.0.20:8554/tpipc45`
 
 ## 快速启动
 
@@ -28,11 +42,7 @@ python main.py
 - Media Service: `POST /onvif/media_service`
 - Events Service: `POST /onvif/events_service`
 
-### 2) 虚拟视频流
-
-- MJPEG 流地址：`GET /stream.mjpg`
-
-### 3) 侦测 Webhook
+### 2) 侦测 Webhook
 
 - 移动侦测触发：`POST /webhook/motion`
 - 人形侦测触发：`POST /webhook/person`
@@ -47,24 +57,6 @@ python main.py
   "metadata": {
     "zone": "entrance"
   }
-}
-```
-
-### 4) 流参数配置
-
-- 查询：`GET /config/stream`
-- 更新：`PUT /config/stream`
-
-更新示例：
-
-```json
-{
-  "width": 1920,
-  "height": 1080,
-  "fps": 25,
-  "bitrate_kbps": 4096,
-  "codec": "MJPEG",
-  "stream_path": "/stream.mjpg"
 }
 ```
 
