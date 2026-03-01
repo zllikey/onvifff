@@ -3,25 +3,19 @@
 这是一个基于 FastAPI 的 ONVIF 虚拟摄像头示例服务，监听端口 **8000**，提供：
 
 - ONVIF Device / Media / Events 基础 SOAP 接口
-- Webhook 触发的移动侦测与人形侦测事件
-- `GetStreamUri` 默认返回 RTSP 流：`rtsp://10.0.0.20:8554/tpipc45`
-
-> 说明：该实现覆盖常见联调所需的标准接口子集（GetCapabilities / GetServices / GetProfiles / GetStreamUri / PullMessages 等），可用于平台接入验证和流程联调。
+- 通过 **GET** 触发移动侦测与人形侦测
+- `GetStreamUri` 默认返回 RTSP：`rtsp://10.0.0.20:8554/tpipc45`
+- 支持 ONVIF 事件主动推送到 NVR 回调地址
 
 ## 参数配置（仅 Python 文件内）
 
-按需求，流参数不再提供 Web 配置接口。请直接在 `main.py` 中修改 `STREAM_CONFIG`：
+按需求，参数都在 `main.py` 里配置：
 
-- `width`
-- `height`
-- `fps`
-- `bitrate_kbps`
-- `codec`
-- `stream_uri`
-
-默认：
-
-- `stream_uri = rtsp://10.0.0.20:8554/tpipc45`
+- `STREAM_CONFIG`：流参数与默认 `stream_uri`
+- `EVENT_PUSH_CONFIG`：主动推送回调配置
+  - `callback_url`
+  - `enabled`
+  - `timeout_sec`
 
 ## 快速启动
 
@@ -42,27 +36,18 @@ python main.py
 - Media Service: `POST /onvif/media_service`
 - Events Service: `POST /onvif/events_service`
 
-### 2) 侦测 Webhook
+### 2) 侦测触发（GET）
 
-- 移动侦测触发：`POST /webhook/motion`
-- 人形侦测触发：`POST /webhook/person`
+- 移动侦测：`GET /webhook/motion?source=detector-a&confidence=0.93&duration_sec=10`
+- 人形侦测：`GET /webhook/person?source=detector-a&confidence=0.98&duration_sec=10`
 
-请求体示例：
-
-```json
-{
-  "source": "detector-a",
-  "confidence": 0.93,
-  "duration_sec": 10,
-  "metadata": {
-    "zone": "entrance"
-  }
-}
-```
+调用后会：
+1. 写入本地事件队列（可由 `PullMessages` 拉取）
+2. 尝试主动 POST SOAP Notify 到 `EVENT_PUSH_CONFIG.callback_url`
 
 ## ONVIF 联调建议
 
 1. 设备发现后调用 `GetCapabilities` 与 `GetServices`
 2. 调用 `GetProfiles` / `GetStreamUri` 获取流地址
-3. 调用 `CreatePullPointSubscription` + `PullMessages` 拉取侦测事件
-4. 通过 webhook 模拟告警输入，验证平台告警链路
+3. 若平台支持回调，配置 `EVENT_PUSH_CONFIG.callback_url`，触发 GET 事件验证主动推送
+4. 若平台使用拉模式，调用 `CreatePullPointSubscription` + `PullMessages` 验证拉取事件

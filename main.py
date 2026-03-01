@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import time
 import uuid
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Literal
+from typing import Deque, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -30,8 +32,15 @@ class StreamConfig(BaseModel):
     stream_uri: str = "rtsp://10.0.0.20:8554/tpipc45"
 
 
-# 需求：流参数直接在 py 文件中设定，不通过 Web 页面/接口动态修改。
+class EventPushConfig(BaseModel):
+    callback_url: str = "http://127.0.0.1:9000/onvif/events/callback"
+    enabled: bool = True
+    timeout_sec: int = Field(default=3, ge=1, le=30)
+
+
+# 按需求：参数在 py 文件内配置，不通过 web 页面配置。
 STREAM_CONFIG = StreamConfig()
+EVENT_PUSH_CONFIG = EventPushConfig()
 
 
 class WebhookEvent(BaseModel):
@@ -54,21 +63,21 @@ class EventBus:
     def __init__(self, max_events: int = 200) -> None:
         self.events: Deque[dict] = deque(maxlen=max_events)
 
-    def publish(self, topic: str, payload: dict) -> None:
-        self.events.append(
-            {
-                "id": str(uuid.uuid4()),
-                "topic": topic,
-                "payload": payload,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+    def publish(self, topic: str, payload: dict) -> dict:
+        item = {
+            "id": str(uuid.uuid4()),
+            "topic": topic,
+            "payload": payload,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        self.events.append(item)
+        return item
 
     def pull(self, limit: int = 10) -> List[dict]:
         return list(self.events)[-limit:]
 
 
-app = FastAPI(title="ONVIF Virtual Camera", version="0.2.0")
+app = FastAPI(title="ONVIF Virtual Camera", version="0.3.0")
 motion_state = DetectionState()
 person_state = DetectionState()
 event_bus = EventBus()
@@ -98,7 +107,7 @@ def build_device_response(method: str, request: Request) -> str:
             <tds:GetDeviceInformationResponse xmlns:tds=\"{NS_TDS}\">
               <tds:Manufacturer>VirtualCam Inc.</tds:Manufacturer>
               <tds:Model>Python ONVIF Virtual Camera</tds:Model>
-              <tds:FirmwareVersion>0.2.0</tds:FirmwareVersion>
+              <tds:FirmwareVersion>0.3.0</tds:FirmwareVersion>
               <tds:SerialNumber>VIRTUAL-001</tds:SerialNumber>
               <tds:HardwareId>SIM-ONVIF</tds:HardwareId>
             </tds:GetDeviceInformationResponse>
@@ -236,6 +245,46 @@ def build_event_response(method: str) -> str:
     raise HTTPException(status_code=400, detail=f"Unsupported ONVIF event operation: {method}")
 
 
+def build_notify_soap(event_item: dict) -> str:
+    return f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<s:Envelope xmlns:s=\"{NS_SOAP}\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:tt=\"{NS_TT}\">
+  <s:Body>
+    <wsnt:Notify>
+      <wsnt:NotificationMessage>
+        <wsnt:Topic>{event_item['topic']}</wsnt:Topic>
+        <wsnt:Message>
+          <tt:Message UtcTime=\"{event_item['ts']}\" PropertyOperation=\"Changed\">
+            <tt:Data>
+              <tt:SimpleItem Name=\"id\" Value=\"{event_item['id']}\"/>
+              <tt:SimpleItem Name=\"source\" Value=\"{event_item['payload'].get('source', 'webhook')}\"/>
+            </tt:Data>
+          </tt:Message>
+        </wsnt:Message>
+      </wsnt:NotificationMessage>
+    </wsnt:Notify>
+  </s:Body>
+</s:Envelope>
+"""
+
+
+def push_event_to_callback(event_item: dict) -> Optional[str]:
+    if not EVENT_PUSH_CONFIG.enabled:
+        return "disabled"
+
+    data = build_notify_soap(event_item).encode("utf-8")
+    req = urllib.request.Request(
+        url=EVENT_PUSH_CONFIG.callback_url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=EVENT_PUSH_CONFIG.timeout_sec) as resp:
+            return f"http_{resp.status}"
+    except urllib.error.URLError as exc:
+        return f"push_failed:{exc.reason}"
+
+
 def extract_action(xml_body: str) -> str:
     root = ET.fromstring(xml_body)
     body = root.find(f"{{{NS_SOAP}}}Body")
@@ -250,23 +299,48 @@ def health() -> dict:
         "status": "ok",
         "detections": {"motion": motion_state.active(), "person": person_state.active()},
         "stream": STREAM_CONFIG.model_dump(),
+        "event_push": EVENT_PUSH_CONFIG.model_dump(),
     }
 
 
-@app.post("/webhook/motion")
-def webhook_motion(payload: WebhookEvent) -> dict:
+@app.get("/webhook/motion")
+def webhook_motion_get(
+    source: str = Query(default="webhook"),
+    confidence: float = Query(default=1.0, ge=0.0, le=1.0),
+    duration_sec: int = Query(default=10, ge=1, le=300),
+) -> dict:
+    payload = WebhookEvent(source=source, confidence=confidence, duration_sec=duration_sec)
     motion_state.active_until = time.time() + payload.duration_sec
     motion_state.confidence = payload.confidence
-    event_bus.publish("tns1:RuleEngine/Motion", payload.model_dump())
-    return {"accepted": True, "motion_until": motion_state.active_until}
+    event_item = event_bus.publish("tns1:RuleEngine/Motion", payload.model_dump())
+    push_result = push_event_to_callback(event_item)
+    return {
+        "accepted": True,
+        "trigger": "motion",
+        "motion_until": motion_state.active_until,
+        "event_id": event_item["id"],
+        "push_result": push_result,
+    }
 
 
-@app.post("/webhook/person")
-def webhook_person(payload: WebhookEvent) -> dict:
+@app.get("/webhook/person")
+def webhook_person_get(
+    source: str = Query(default="webhook"),
+    confidence: float = Query(default=1.0, ge=0.0, le=1.0),
+    duration_sec: int = Query(default=10, ge=1, le=300),
+) -> dict:
+    payload = WebhookEvent(source=source, confidence=confidence, duration_sec=duration_sec)
     person_state.active_until = time.time() + payload.duration_sec
     person_state.confidence = payload.confidence
-    event_bus.publish("tns1:Analytics/HumanDetection", payload.model_dump())
-    return {"accepted": True, "person_until": person_state.active_until}
+    event_item = event_bus.publish("tns1:Analytics/HumanDetection", payload.model_dump())
+    push_result = push_event_to_callback(event_item)
+    return {
+        "accepted": True,
+        "trigger": "person",
+        "person_until": person_state.active_until,
+        "event_id": event_item["id"],
+        "push_result": push_result,
+    }
 
 
 @app.post("/onvif/device_service")
